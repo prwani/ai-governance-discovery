@@ -1,0 +1,4 @@
+__pycache__/
+*.py[cod]
+# Local scan inventories and generated HTML reports can contain confidential Azure metadata.
+outputs/
