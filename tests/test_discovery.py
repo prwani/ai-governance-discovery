@@ -7,7 +7,7 @@ from unittest.mock import call, mock_open, patch
 from contextlib import redirect_stderr, redirect_stdout
 
 import scan
-from discovery import apim, azure, foundry
+from discovery import apim, azure, foundry, monitoring, policy
 
 
 SUBSCRIPTION = {
@@ -124,7 +124,11 @@ class ScanOutputTests(unittest.TestCase):
             "disabled", "subscription",
             "Subscription is not Enabled; not scanned",
         )
-        client.list.assert_called_once_with("/subscriptions", "2022-12-01")
+        self.assertEqual(client.list.call_args_list, [
+            call("/subscriptions", "2022-12-01"),
+            call("/subscriptions/sub-1/providers/Microsoft.Authorization/policyAssignments",
+                 policy.API_VERSION),
+        ])
         collect_rbac.assert_called_once_with(client, [], {})
         collect_usage.assert_called_once()
         collect_retirements.assert_called_once()
@@ -162,6 +166,48 @@ class FoundryTests(unittest.TestCase):
         resource["properties"] = {}
         self.assertEqual(foundry.resource_row(resource, SUBSCRIPTION)["key_based_access"], "unknown")
 
+    def test_policy_assignment_summary_keeps_control_metadata_without_parameter_values(self):
+        row = policy.assignment_summary({
+            "id": "/subscriptions/sub-1/providers/Microsoft.Authorization/policyAssignments/locations",
+            "name": "locations",
+            "properties": {
+                "displayName": "Allowed locations",
+                "scope": "/subscriptions/sub-1",
+                "policyDefinitionId": "/providers/Microsoft.Authorization/policyDefinitions/allowed",
+                "enforcementMode": "Default",
+                "notScopes": [],
+                "parameters": {
+                    "effect": {"value": "Deny"},
+                    "listOfAllowedLocations": {"value": ["eastus"]},
+                    "sensitiveSetting": {"value": "do not export"},
+                },
+            },
+        })
+
+        self.assertEqual(row["effect"], "Deny")
+        self.assertEqual(row["parameter_names"],
+                         ["effect", "listOfAllowedLocations", "sensitiveSetting"])
+        self.assertNotIn("eastus", json.dumps(row))
+        self.assertNotIn("do not export", json.dumps(row))
+
+    def test_diagnostic_summary_only_exports_enabled_categories_and_destinations(self):
+        row = monitoring.diagnostic_summary({
+            "id": "/resource/providers/Microsoft.Insights/diagnosticSettings/default",
+            "name": "default",
+            "properties": {
+                "workspaceId": "/subscriptions/sub-1/workspaces/logs",
+                "logs": [
+                    {"category": "AuditEvent", "enabled": True},
+                    {"category": "RequestResponse", "enabled": False},
+                ],
+                "metrics": [{"category": "AllMetrics", "enabled": True}],
+            },
+        })
+
+        self.assertEqual(row["destination_types"], ["workspace"])
+        self.assertEqual(row["enabled_log_categories"], ["AuditEvent"])
+        self.assertEqual(row["enabled_metric_categories"], ["AllMetrics"])
+
     def test_project_key_access_uses_parent_account_setting(self):
         account = {"id": ACCOUNT_ID, "properties": {"disableLocalAuth": True}}
         project = {"id": ACCOUNT_ID + "/projects/project", "name": "project",
@@ -169,6 +215,47 @@ class FoundryTests(unittest.TestCase):
         row = foundry.resource_row(project, SUBSCRIPTION, ACCOUNT_ID, account)
         self.assertEqual(row["key_based_access"], "disabled")
         self.assertEqual(row["key_based_access_source_resource_id"], ACCOUNT_ID)
+
+    def test_resource_row_summarizes_private_endpoints_without_connection_descriptions(self):
+        resource = {
+            "id": ACCOUNT_ID, "name": "ai",
+            "properties": {"privateEndpointConnections": [{
+                "id": ACCOUNT_ID + "/privateEndpointConnections/pe1",
+                "properties": {
+                    "privateEndpoint": {"id": "/subscriptions/sub-1/privateEndpoints/pe1"},
+                    "groupIds": ["account"],
+                    "privateLinkServiceConnectionState": {
+                        "status": "Approved", "actionsRequired": "None",
+                        "description": "do not export private description",
+                    },
+                },
+            }]},
+        }
+        row = foundry.resource_row(resource, SUBSCRIPTION)
+
+        self.assertEqual(row["private_endpoint_count"], 1)
+        self.assertIn('"status": "Approved"', row["private_endpoint_connections"])
+        self.assertNotIn("do not export", row["private_endpoint_connections"])
+
+    def test_rai_policy_summary_keeps_filter_settings_but_not_blocklist_contents(self):
+        row = foundry.rai_policy_summary({
+            "id": ACCOUNT_ID + "/raiPolicies/policy",
+            "name": "policy",
+            "properties": {
+                "mode": "Blocking",
+                "basePolicyName": "Microsoft.Default",
+                "contentFilters": [{
+                    "name": "Hate", "source": "Prompt", "enabled": True,
+                    "blocking": True, "severityThreshold": "Medium",
+                }],
+                "customBlocklists": [{"name": "custom", "contents": ["private term"]}],
+            },
+        })
+        encoded = json.dumps(row)
+
+        self.assertEqual(row["content_filters"][0]["severityThreshold"], "Medium")
+        self.assertEqual(row["custom_blocklist_count"], 1)
+        self.assertNotIn("private term", encoded)
 
     def test_token_limit_uses_token_rules_not_request_limits(self):
         rules = [
@@ -189,6 +276,7 @@ class FoundryTests(unittest.TestCase):
             "properties": {
                 "model": {"name": "gpt-example", "version": "1", "format": "OpenAI"},
                 "rateLimits": [{"key": "Tokens", "count": 60000, "renewalPeriod": 60}],
+                "raiPolicyName": "custom-policy",
             },
         }
         account = {
@@ -206,6 +294,9 @@ class FoundryTests(unittest.TestCase):
             def list(self, path, api_version):
                 if path.endswith("/accounts"):
                     return [account]
+                if path.endswith("/raiPolicies"):
+                    return [{"id": ACCOUNT_ID + "/raiPolicies/default", "name": "default",
+                             "properties": {"mode": "Blocking", "contentFilters": []}}]
                 if path.endswith("/models"):
                     return [model]
                 if path.endswith("/deployments"):
@@ -219,12 +310,34 @@ class FoundryTests(unittest.TestCase):
 
         resources, deployments = foundry.collect_foundry(FakeClient(), SUBSCRIPTION)
         self.assertEqual(resources[0]["id"], ACCOUNT_ID)
+        self.assertIn("default", resources[0]["rai_policies"])
         self.assertEqual(deployments[0]["allocated_tpm"], 60000)
+        self.assertEqual(deployments[0]["rai_policy_name"], "custom-policy")
         self.assertEqual(deployments[1]["allocated_tpm"], 18000)
         self.assertIn("account.models.skus", deployments[1]["tpm_source"])
         for row in deployments:
             self.assertFalse(any("quota" in key for key in row))
             self.assertNotIn("model_max_capacity", row)
+
+    def test_content_safety_accounts_are_inventoried_without_model_collection(self):
+        safety = {
+            "id": ACCOUNT_ID + "-safety", "name": "safety", "kind": "ContentSafety",
+            "properties": {"publicNetworkAccess": "Disabled"},
+        }
+
+        class FakeClient:
+            def list(self, path, api_version):
+                if path.endswith("/accounts"):
+                    return [safety]
+                if path.endswith("/workspaces"):
+                    return []
+                raise AssertionError("Unexpected content-safety request: " + path)
+
+        resources, deployments = foundry.collect_foundry(FakeClient(), SUBSCRIPTION)
+
+        self.assertEqual([row["name"] for row in resources], ["safety"])
+        self.assertEqual(resources[0]["public_network_access"], "Disabled")
+        self.assertEqual(deployments, [])
 
     def test_regional_quotas_keep_native_units_without_deployment_join(self):
         resource = {"type": "Microsoft.CognitiveServices/accounts", "location": "eastus"}
@@ -254,6 +367,8 @@ class ApiManagementMappingTests(unittest.TestCase):
                 if path.endswith("/service"):
                     return [{"id": service_id, "name": "apim", "sku": {"name": "Consumption"},
                              "properties": {"publicNetworkAccess": "Enabled"}}]
+                if path.endswith(("/apis", "/products", "/subscriptions")):
+                    return []
                 if path == service_id + "/backends":
                     return [{"id": path + "/b1", "name": "b1", "properties": {
                         "url": "https://ai.example", "credentials": {"secret": "must-not-export"},
@@ -265,6 +380,68 @@ class ApiManagementMappingTests(unittest.TestCase):
         self.assertEqual(services[0]["public_network_access"], "Enabled")
         self.assertEqual(backends[0]["url"], "https://ai.example")
         self.assertNotIn("must-not-export", json.dumps(backends))
+        self.assertEqual(services[0]["api_count"], 0)
+
+    def test_apim_inventory_captures_api_product_and_subscription_metadata_without_keys(self):
+        service_id = "/subscriptions/sub-1/apim/service/apim"
+
+        class FakeClient:
+            def list(self, path, api_version):
+                if path == "/subscriptions/sub-1/providers/Microsoft.ApiManagement/service":
+                    return [{"id": service_id, "name": "apim", "sku": {"name": "Premium"},
+                             "properties": {}}]
+                if path == service_id + "/apis":
+                    return [{"id": service_id + "/apis/chat", "name": "chat",
+                             "properties": {"displayName": "Chat", "path": "chat",
+                                            "subscriptionRequired": True,
+                                            "serviceUrl": "https://backend.example?api-key=secret"}}]
+                if path == service_id + "/products":
+                    return [{"id": service_id + "/products/team", "name": "team",
+                             "properties": {"displayName": "Team", "approvalRequired": True,
+                                            "state": "published"}}]
+                if path == service_id + "/products/team/apis":
+                    return [{"id": service_id + "/apis/chat"}]
+                if path == service_id + "/subscriptions":
+                    return [{"id": service_id + "/subscriptions/sub1", "name": "sub1",
+                             "properties": {"displayName": "Consumer", "ownerId": "owner",
+                                            "state": "active", "primaryKey": "secret-key"}}]
+                if path.endswith(("/backends", "/workspaces")):
+                    return []
+                raise AssertionError("Unexpected list path: " + path)
+
+        services, _ = apim.collect_apim(FakeClient(), SUBSCRIPTION)
+        row = services[0]
+        self.assertEqual(row["api_count"], 1)
+        self.assertEqual(row["product_count"], 1)
+        self.assertEqual(row["subscription_count"], 1)
+        self.assertEqual(json.loads(row["product_inventory"])[0]["api_ids"],
+                         [service_id + "/apis/chat"])
+        exported = json.dumps(row)
+        self.assertNotIn("secret-key", exported)
+        self.assertNotIn("api-key=secret", exported)
+
+    def test_apim_inventory_marks_failed_list_as_partial_not_empty(self):
+        service_id = "/subscriptions/sub-1/apim/service/apim"
+
+        class FakeClient:
+            errors = []
+
+            def list(self, path, api_version):
+                if path == "/subscriptions/sub-1/providers/Microsoft.ApiManagement/service":
+                    return [{"id": service_id, "name": "apim", "sku": {"name": "Consumption"},
+                             "properties": {}}]
+                if path == service_id + "/apis":
+                    self.errors.append({"scope": path})
+                    return []
+                if path.endswith(("/products", "/subscriptions", "/backends")):
+                    return []
+                raise AssertionError("Unexpected list path: " + path)
+
+        services, _ = apim.collect_apim(FakeClient(), SUBSCRIPTION)
+
+        self.assertEqual(services[0]["api_count"], 0)
+        self.assertEqual(services[0]["api_inventory_status"], "partial")
+        self.assertEqual(services[0]["product_inventory_status"], "complete")
 
     def setUp(self):
         self.resource = {
@@ -361,6 +538,8 @@ class ApiManagementMappingTests(unittest.TestCase):
                              "type": "Microsoft.MachineLearningServices/workspaces"}]
                 if path.endswith("/serverlessEndpoints"):
                     return [endpoint]
+                if path.endswith("/raiPolicies"):
+                    return []
                 if path.endswith(("/onlineEndpoints", "/batchEndpoints")):
                     return []
                 raise AssertionError(f"Unexpected list path: {path}")

@@ -1,0 +1,8 @@
+﻿Pillar,Questions,Automatable (Y),Not automatable (N),Python,PowerShell,Exists in repo (Y),Partially implemented,Not implemented,azure_dependent,source_code_repo_dependent
+#1 AI CoE and Governance,80,37,43,20,17,2,9,26,Y,Y
+#2 AI Landing Zones,108,80,28,20,60,7,21,52,Y,Y
+#3 AgentOps,112,74,38,48,26,2,12,60,Y,Y
+#4 AI Security & Observability,148,109,39,52,57,4,20,85,Y,Y
+#5 Solution Optimisation,96,74,22,31,43,5,7,62,Y,Y
+#6 Agent Architectures,128,72,56,56,16,0,3,69,Y,Y
+Total,672,446,226,227,219,20,72,354,Y,Y

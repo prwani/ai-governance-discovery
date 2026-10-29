@@ -16,6 +16,8 @@ python3 -m unittest discover -s tests -v
 - **`scan.py`**: Python 3.10+ and Azure CLI, signed in to the target tenant with
   `az login`. Assign the built-in **Reader** role on every subscription to scan.
   For a custom role, grant the required read actions, including
+  `Microsoft.Authorization/policyAssignments/read`,
+  `Microsoft.Insights/diagnosticSettings/read`,
   `Microsoft.Insights/metricDefinitions/read`,
   `Microsoft.Insights/metrics/read`,
   `Microsoft.Authorization/roleAssignments/read`, and
@@ -119,20 +121,25 @@ python3 report.py outputs/my-scan --output governance-report.html
 The default file is `outputs/my-scan/governance-report.html`. Open it in a browser;
 no web server, external assets, JavaScript, packages or Azure login are needed for
 report generation. Inventory values are HTML-escaped. Existing reports are never
-overwritten. The report contains:
+overwritten. The report is grouped by the six assessment pillars in the workbook. It includes
+the existing network, access, RBAC, mapping, usage and retirement findings, plus:
 
-1. Foundry resources with explicit public network access enabled.
-2. Foundry resources with key-based access allowed.
-3. APIM resources with explicit public network access enabled.
-4. Foundry User/ServicePrincipal role assignments, grouped by resource/principal,
-   with all assigned roles, scopes and conditions. This is not an effective
-   permission calculation; unrelated-service RBAC roles do not prove Foundry access.
-5. Model deployments without a confirmed deployment-level APIM backend mapping,
-   separating account/endpoint-level matches from absent matches.
-6. Deployments with zero successful requests over 7 and 30 days, with failed
-   attempts displayed separately and unknown telemetry clearly separated.
-7. Deployments past their published retirement date or retiring within 90 days,
-   with dates, replacement suggestions and unresolved matches.
+- Subscription Azure Policy assignments, with parameter names but not values.
+- Foundry private endpoint connection state and account RAI/content-filter
+  settings; custom blocklist contents are excluded.
+- Diagnostic-setting destinations and enabled categories for discovered
+  Foundry/AI and APIM resources.
+- APIM API, product and subscription summaries in the existing APIM inventory,
+  with keys and policy XML excluded.
+- Regional AI quota usage using Azure's native units.
+
+The header contains a linked table of contents listing each pillar and its
+subsections. Every pillar and subsection has "Back to top" links at its start
+and end.
+
+The Agent Architectures pillar explicitly identifies that this scanner does not
+yet collect Foundry agent definitions or tool connections. Checks outside the
+scanner's collected evidence are not inferred as present or absent.
 
 The first two sections show only subscription, resource group and resource name.
 Unknown access settings are counted separately, not assumed enabled or disabled.
@@ -141,6 +148,8 @@ Old scans without APIM's `public_network_access` column report that setting as
 unknown; run a new scan to populate it. Missing mapping evidence cannot prove
 that a deployment is not routed through APIM policies or runtime selection.
 Collection errors and scan status are prominently displayed.
+Newer collection fields distinguish complete, partial, missing and older-scan
+data where applicable; a failed list is not presented as an empty result.
 
 The scanner lists subscriptions directly from ARM and scans **every enabled subscription
 visible to the signed-in principal in the current Azure CLI tenant**, not just the
@@ -155,14 +164,14 @@ Each run creates a new private directory under `outputs/`:
 
 | File | Contents |
 |---|---|
-| `subscriptions.csv` | Subscription scope and complete/partial/skipped status |
-| `foundry_resources.csv` | AI Services/Foundry and OpenAI accounts, native projects, ML workspaces including legacy hubs/projects |
-| `model_deployments.csv` | Account model deployments and workspace online/batch deployments and serverless endpoints |
+| `subscriptions.csv` | Subscription scope and complete/partial/skipped status, plus policy-assignment summaries |
+| `foundry_resources.csv` | AI Services/Foundry, OpenAI and Content Safety accounts, native projects, ML workspaces including legacy hubs/projects; private endpoint connection state, account RAI policies, and diagnostic settings |
+| `model_deployments.csv` | Account model deployments and workspace online/batch deployments and serverless endpoints, including configured RAI policy name |
 | `regional_quotas.csv` | Subscription/region quota usage names, current allocation, limits and native units |
 | `foundry_role_assignments.csv` | Direct and inherited Azure RBAC assignments for each discovered Foundry resource/project |
 | `model_usage.csv` | Deployment request/token metrics for separate 7- and 30-day windows, including collection status |
 | `model_retirements.csv` | Exact model/version retirement comparisons, source timestamps and 90-day warnings |
-| `apim_resources.csv` | All API Management services |
+| `apim_resources.csv` | API Management services plus API, product, subscription, and diagnostic-setting inventories (keys excluded) |
 | `apim_backends.csv` | Service and workspace backend URLs, ARM references and backend pool members |
 | `apim_foundry_mappings.csv` | Backend-to-resource/deployment relationships with evidence and match status |
 | `scan_errors.csv` | Failed requests, missing access, invalid responses and skipped subscriptions |
@@ -186,6 +195,29 @@ report their parent account's authentication setting, identified by
 `key_based_access_source_resource_id`. This is an authentication configuration,
 not a connectivity check: firewall/network rules may still block access.
 No keys are retrieved.
+
+The same file includes private endpoint connection IDs, group IDs and approval
+state for discovered Foundry/AI resources; it does not prove DNS resolution or
+network reachability. OpenAI/AI Services accounts also include a summarized
+`rai_policies` JSON value with content-filter settings and custom blocklist
+counts, but never blocklist contents. Deployment rows include `rai_policy_name`
+when Azure reports one. Content Safety accounts are inventoried as AI resources,
+but their data-plane settings are not queried.
+
+`apim_resources.csv` retains the service/API/product/subscription inventory in
+JSON columns on each service row instead of creating parallel CSVs. The
+subscription summary contains owner ID, scope and state, but never primary or
+secondary subscription keys. API service URLs are sanitized with the same
+allowlist as backend URLs. Product entries include API IDs and approval/state
+settings; policy XML is not exported.
+
+Subscription rows include policy-assignment identity, scope, definition ID,
+effect and parameter names; assignment parameter values are not exported.
+Assignment discovery is subscription-scoped and does not calculate inherited
+management-group policy or compliance state. Foundry and APIM resource rows
+include diagnostic-setting destinations and enabled log/metric categories.
+These settings show configured routing only, not whether logs are arriving or
+retained at the destination.
 
 ## Model usage and retirement
 

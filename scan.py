@@ -14,15 +14,21 @@ from discovery.azure import AzureClient, cli_json
 
 
 SCHEMAS = {
-    "subscriptions": ["subscription_id", "subscription_name", "tenant_id", "state", "scan_status"],
+    "subscriptions": ["subscription_id", "subscription_name", "tenant_id", "state",
+                      "scan_status", "policy_assignment_count", "policy_assignments",
+                      "policy_assignment_status"],
     "foundry_resources": ["id", "name", "type", "kind", "location", "subscription_id",
                           "subscription_name", "tenant_id", "resource_group", "parent_id",
                           "endpoint", "endpoints", "disable_local_auth", "key_based_access",
-                          "key_based_access_source_resource_id"],
+                          "key_based_access_source_resource_id", "private_endpoint_count",
+                          "private_endpoint_connections", "rai_policies",
+                          "rai_policy_inventory_status", "diagnostic_setting_count",
+                          "diagnostic_settings", "diagnostic_settings_status"],
     "model_deployments": ["id", "name", "resource_id", "account_id", "subscription_id",
                           "subscription_name", "tenant_id", "resource_group", "location",
                           "model_name", "model_version", "model_format", "deployment_type",
-                          "capacity", "capacity_unit", "allocated_tpm", "endpoint"],
+                          "capacity", "capacity_unit", "allocated_tpm", "endpoint",
+                          "rai_policy_name"],
     "regional_quotas": ["subscription_id", "subscription_name", "tenant_id", "location",
                         "usage_name", "display_name", "current_value", "limit", "unit"],
     "foundry_role_assignments": ["foundry_resource_id", "foundry_resource_name",
@@ -42,7 +48,12 @@ SCHEMAS = {
                           "retirement_status", "warning_days", "source_url",
                           "schedule_retrieved_at", "notes"],
     "apim_resources": ["id", "name", "subscription_id", "subscription_name", "tenant_id",
-                       "resource_group", "location", "sku", "gateway_url"],
+                       "resource_group", "location", "sku", "gateway_url", "api_count",
+                       "api_inventory", "product_count", "product_inventory",
+                       "subscription_count", "subscription_inventory",
+                       "api_inventory_status", "product_inventory_status",
+                       "subscription_inventory_status", "diagnostic_setting_count",
+                       "diagnostic_settings", "diagnostic_settings_status"],
     "apim_backends": ["id", "name", "apim_id", "apim_name", "workspace_id", "url",
                       "resource_id", "protocol", "backend_type", "pool_members"],
     "apim_foundry_mappings": ["apim_id", "apim_name", "backend_id", "backend_name",
@@ -77,6 +88,8 @@ def run(output, retirement_warning_days=90):
     from discovery.rbac import collect_role_assignments
     from discovery.usage import collect_usage
     from discovery.retirements import collect_retirements
+    from discovery.policy import collect_policy_assignments
+    from discovery.monitoring import attach_diagnostic_settings
 
     os.umask(0o077)
     started = datetime.now(timezone.utc).isoformat()
@@ -110,10 +123,19 @@ def run(output, retirement_warning_days=90):
             continue
         print(f"Scanning {subscription['name']} ({subscription['id']})", flush=True)
         failures = len(client.errors)
+        previous_errors = len(client.errors)
+        assignments = collect_policy_assignments(client, subscription)
+        subrow["policy_assignment_count"] = len(assignments)
+        subrow["policy_assignments"] = json.dumps(assignments, sort_keys=True)
+        subrow["policy_assignment_status"] = (
+            "partial" if len(client.errors) > previous_errors else "complete"
+        )
         resources, deployments = collect_foundry(client, subscription)
         quotas = collect_quotas(client, subscription, resources)
         assignments = collect_role_assignments(client, resources, role_definitions)
         services, backends = collect_apim(client, subscription)
+        attach_diagnostic_settings(client, resources)
+        attach_diagnostic_settings(client, services)
         tables["foundry_resources"].extend(resources)
         tables["model_deployments"].extend(deployments)
         tables["regional_quotas"].extend(quotas)

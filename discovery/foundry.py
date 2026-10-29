@@ -21,6 +21,44 @@ def context(resource, subscription):
     }
 
 
+def private_endpoint_summary(resource):
+    """Keep connection state evidence without exporting user-supplied descriptions."""
+    connections = []
+    for connection in resource.get("properties", {}).get("privateEndpointConnections", []):
+        if not isinstance(connection, dict):
+            continue
+        properties = connection.get("properties", {})
+        state = properties.get("privateLinkServiceConnectionState", {})
+        endpoint = properties.get("privateEndpoint", {})
+        connections.append({
+            "id": connection.get("id", ""),
+            "private_endpoint_id": endpoint.get("id", ""),
+            "group_ids": properties.get("groupIds", []),
+            "status": state.get("status", ""),
+            "actions_required": state.get("actionsRequired", ""),
+        })
+    return connections
+
+
+def rai_policy_summary(policy):
+    """Retain filter configuration but never export custom blocklist contents."""
+    properties = policy.get("properties", {})
+    return {
+        "id": policy.get("id", ""),
+        "name": policy.get("name", ""),
+        "mode": properties.get("mode", ""),
+        "base_policy_name": properties.get("basePolicyName", ""),
+        "content_filters": [
+            {key: item.get(key, "") for key in
+             ("name", "source", "enabled", "blocking", "severityThreshold")}
+            for item in properties.get("contentFilters", [])
+            if isinstance(item, dict)
+        ],
+        "custom_blocklist_count": len(properties.get("customBlocklists", []))
+        if isinstance(properties.get("customBlocklists", []), list) else "",
+    }
+
+
 def resource_row(resource, subscription, parent_id="", auth_resource=None):
     properties = resource.get("properties", {})
     auth_resource = resource if auth_resource is None else auth_resource
@@ -42,6 +80,9 @@ def resource_row(resource, subscription, parent_id="", auth_resource=None):
         "key_based_access": key_access,
         "key_based_access_source_resource_id": auth_resource["id"],
         "hub_resource_id": properties.get("hubResourceId", ""),
+        "private_endpoint_count": len(private_endpoint_summary(resource)),
+        "private_endpoint_connections": json.dumps(
+            private_endpoint_summary(resource), sort_keys=True),
     }
 
 
@@ -79,6 +120,7 @@ def deployment_row(deployment, account, subscription):
         "rate_limits": json.dumps(rules, sort_keys=True),
         "provisioning_state": properties.get("provisioningState", ""),
         "version_upgrade_option": properties.get("versionUpgradeOption", ""),
+        "rai_policy_name": properties.get("raiPolicyName", ""),
     }
 
 
@@ -87,9 +129,27 @@ def collect_foundry(client, subscription):
     resources, deployments = [], []
     accounts = client.list(base + "/providers/Microsoft.CognitiveServices/accounts", COGNITIVE_VERSION)
     for account in accounts:
-        if account.get("kind", "").lower() not in ("openai", "aiservices"):
+        kind = account.get("kind", "").lower()
+        if kind not in ("openai", "aiservices", "contentsafety"):
             continue
-        resources.append(resource_row(account, subscription))
+        policies = []
+        policy_status = "not_applicable"
+        if kind in ("openai", "aiservices"):
+            previous_errors = len(getattr(client, "errors", ()))
+            policies = [
+                rai_policy_summary(policy) for policy in client.list(
+                    account["id"] + "/raiPolicies", COGNITIVE_VERSION
+                )
+            ]
+            policy_status = (
+                "partial" if len(getattr(client, "errors", ())) > previous_errors else "complete"
+            )
+        account_row = resource_row(account, subscription)
+        account_row["rai_policies"] = json.dumps(policies, sort_keys=True)
+        account_row["rai_policy_inventory_status"] = policy_status
+        resources.append(account_row)
+        if kind == "contentsafety":
+            continue
         models = client.list(account["id"] + "/models", COGNITIVE_VERSION)
         for item in client.list(account["id"] + "/deployments", COGNITIVE_VERSION):
             row = deployment_row(item, account, subscription)

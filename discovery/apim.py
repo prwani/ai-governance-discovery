@@ -37,6 +37,55 @@ def backend_row(backend, service, workspace_id=""):
     }
 
 
+def api_summary(api, workspace_id=""):
+    properties = api.get("properties", {})
+    return {
+        "id": api.get("id", ""),
+        "name": api.get("name", ""),
+        "workspace_id": workspace_id,
+        "display_name": properties.get("displayName", ""),
+        "path": properties.get("path", ""),
+        "api_type": properties.get("type", ""),
+        "api_revision": properties.get("apiRevision", ""),
+        "api_version": properties.get("apiVersion", ""),
+        "protocols": properties.get("protocols", []),
+        "subscription_required": properties.get("subscriptionRequired", ""),
+        "service_url": safe_url(properties.get("serviceUrl", "")),
+    }
+
+
+def product_summary(client, product, workspace_id=""):
+    properties = product.get("properties", {})
+    apis_path = product["id"] + "/apis"
+    previous_errors = len(getattr(client, "errors", ()))
+    apis = client.list(apis_path, API_VERSION)
+    return {
+        "id": product.get("id", ""),
+        "name": product.get("name", ""),
+        "workspace_id": workspace_id,
+        "display_name": properties.get("displayName", ""),
+        "approval_required": properties.get("approvalRequired", ""),
+        "subscription_required": properties.get("subscriptionRequired", ""),
+        "state": properties.get("state", ""),
+        "api_ids": [api.get("id", "") for api in apis],
+        "api_inventory_status": (
+            "partial" if len(getattr(client, "errors", ())) > previous_errors else "complete"
+        ),
+    }
+
+
+def subscription_summary(subscription):
+    properties = subscription.get("properties", {})
+    return {
+        "id": subscription.get("id", ""),
+        "name": subscription.get("name", ""),
+        "display_name": properties.get("displayName", ""),
+        "owner_id": properties.get("ownerId", ""),
+        "scope": properties.get("scope", ""),
+        "state": properties.get("state", ""),
+    }
+
+
 def collect_apim(client, subscription):
     base = f"/subscriptions/{subscription['id']}/providers/Microsoft.ApiManagement/service"
     resources, backends = [], []
@@ -55,10 +104,63 @@ def collect_apim(client, subscription):
             "public_network_access": props.get("publicNetworkAccess", ""),
             "workspace_inventory_status": "attempted" if workspace_supported else "not_supported_by_tier",
         }
+        previous_errors = len(getattr(client, "errors", ()))
+        apis = [api_summary(api) for api in client.list(service["id"] + "/apis", API_VERSION)]
+        api_status = "partial" if len(getattr(client, "errors", ())) > previous_errors else "complete"
+        previous_errors = len(getattr(client, "errors", ()))
+        products = [product_summary(client, product) for product in
+                    client.list(service["id"] + "/products", API_VERSION)]
+        product_status = (
+            "partial" if len(getattr(client, "errors", ())) > previous_errors else "complete"
+        )
+        if any(product.get("api_inventory_status") == "partial" for product in products):
+            product_status = "partial"
+        previous_errors = len(getattr(client, "errors", ()))
+        subscriptions = [subscription_summary(item) for item in
+                         client.list(service["id"] + "/subscriptions", API_VERSION)]
+        subscription_status = (
+            "partial" if len(getattr(client, "errors", ())) > previous_errors else "complete"
+        )
         resources.append(row)
+        previous_errors = len(getattr(client, "errors", ()))
+        workspaces = client.list(service["id"] + "/workspaces", API_VERSION) \
+            if workspace_supported else []
+        workspace_status = (
+            "partial" if len(getattr(client, "errors", ())) > previous_errors else "complete"
+        )
+        for workspace in workspaces:
+            workspace_id = workspace["id"]
+            previous_errors = len(getattr(client, "errors", ()))
+            apis.extend(
+                api_summary(api, workspace_id)
+                for api in client.list(workspace_id + "/apis", API_VERSION)
+            )
+            if len(getattr(client, "errors", ())) > previous_errors:
+                api_status = "partial"
+            previous_errors = len(getattr(client, "errors", ()))
+            products.extend(
+                product_summary(client, product, workspace_id)
+                for product in client.list(workspace_id + "/products", API_VERSION)
+            )
+            if len(getattr(client, "errors", ())) > previous_errors or any(
+                    product.get("api_inventory_status") == "partial"
+                    for product in products):
+                product_status = "partial"
+        if workspace_status == "partial":
+            api_status = product_status = "partial"
+        row.update({
+            "api_count": len(apis),
+            "api_inventory": json.dumps(apis, sort_keys=True),
+            "api_inventory_status": api_status,
+            "product_count": len(products),
+            "product_inventory": json.dumps(products, sort_keys=True),
+            "product_inventory_status": product_status,
+            "subscription_count": len(subscriptions),
+            "subscription_inventory": json.dumps(subscriptions, sort_keys=True),
+            "subscription_inventory_status": subscription_status,
+        })
         for backend in client.list(service["id"] + "/backends", API_VERSION):
             backends.append(backend_row(backend, service))
-        workspaces = client.list(service["id"] + "/workspaces", API_VERSION) if workspace_supported else []
         for workspace in workspaces:
             for backend in client.list(workspace["id"] + "/backends", API_VERSION):
                 backends.append(backend_row(backend, service, workspace["id"]))

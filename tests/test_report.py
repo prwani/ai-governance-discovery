@@ -1,6 +1,8 @@
 import unittest
+import json
+from html import escape
 
-from report import build_sections, render_report
+from report import PILLARS, SECTION_PILLARS, build_sections, render_report
 
 
 class ReportTests(unittest.TestCase):
@@ -9,19 +11,76 @@ class ReportTests(unittest.TestCase):
             "foundry_resources": [
                 {"id": "/accounts/ai", "name": "<script>alert(1)</script>",
                  "subscription_name": "Subscription", "resource_group": "rg",
-                 "public_network_access": "Enabled", "key_based_access": "disabled"},
+                 "public_network_access": "Enabled", "key_based_access": "disabled",
+                 "private_endpoint_connections": json.dumps([{
+                     "private_endpoint_id": "/privateEndpoints/pe1", "status": "Approved",
+                     "group_ids": ["account"], "actions_required": "None",
+                 }]),
+                 "rai_policies": json.dumps([{
+                     "name": "safe-policy", "mode": "Blocking", "base_policy_name": "default",
+                     "content_filters": [{"name": "Hate", "enabled": True, "blocking": True,
+                                          "severityThreshold": "Medium"}],
+                     "custom_blocklist_count": 1,
+                 }]),
+                 "diagnostic_setting_count": "1",
+                 "diagnostic_settings": json.dumps([{
+                     "name": "to-logs", "destination_types": ["workspace"],
+                     "enabled_log_categories": ["AuditEvent"],
+                     "enabled_metric_categories": ["AllMetrics"],
+                 }])},
                 {"id": "/accounts/ai/projects/p", "name": "p", "subscription_name": "Subscription",
-                 "resource_group": "rg", "public_network_access": "", "key_based_access": "allowed"},
+                 "resource_group": "rg", "public_network_access": "", "key_based_access": "allowed",
+                 "private_endpoint_connections": "[]", "rai_policies": "[]",
+                 "diagnostic_setting_count": "0", "diagnostic_settings": "[]"},
             ],
             "model_deployments": [
-                {"id": "/accounts/ai/deployments/a", "resource_id": "/accounts/ai", "name": "a"},
+                {"id": "/accounts/ai/deployments/a", "resource_id": "/accounts/ai", "name": "a",
+                 "rai_policy_name": "safe-policy"},
                 {"id": "/accounts/ai/deployments/b", "resource_id": "/accounts/ai", "name": "b"},
             ],
             "apim_resources": [
-                {"name": "public-apim", "public_network_access": "Enabled"},
-                {"name": "private-apim", "public_network_access": "Disabled"},
+                {"name": "public-apim", "public_network_access": "Enabled",
+                 "subscription_name": "Subscription", "resource_group": "rg",
+                 "api_inventory": json.dumps([{"name": "chat", "display_name": "Chat",
+                                               "path": "chat", "api_revision": "1",
+                                               "api_version": "", "api_type": "http",
+                                               "subscription_required": True}]),
+                 "product_inventory": json.dumps([{"name": "team", "display_name": "Team",
+                                                   "state": "published", "approval_required": True,
+                                                   "subscription_required": True,
+                                                   "api_ids": ["/apis/chat"]}]),
+                 "subscription_inventory": json.dumps([{"name": "team-sub",
+                                                        "display_name": "Team subscription",
+                                                        "owner_id": "owner",
+                                                        "scope": "/products/team",
+                                                        "state": "active"}]),
+                 "diagnostic_setting_count": "1",
+                 "diagnostic_settings": json.dumps([{
+                     "name": "apim-logs", "destination_types": ["workspace"],
+                     "enabled_log_categories": ["GatewayLogs"],
+                     "enabled_metric_categories": [],
+                 }])},
+                {"name": "private-apim", "public_network_access": "Disabled",
+                 "subscription_name": "Subscription", "resource_group": "rg",
+                 "api_inventory": "[]", "product_inventory": "[]",
+                 "subscription_inventory": "[]", "diagnostic_setting_count": "0",
+                 "diagnostic_settings": "[]"},
                 {"name": "unknown-apim", "gateway_url": "https://public.example"},
             ],
+            "subscriptions": [{
+                "subscription_name": "Subscription",
+                "policy_assignments": json.dumps([{
+                    "display_name": "Allowed locations",
+                    "policy_definition_id": "/policyDefinitions/locations",
+                    "scope": "/subscriptions/sub", "enforcement_mode": "Default",
+                    "effect": "Deny", "parameter_names": ["listOfAllowedLocations"],
+                }]),
+            }],
+            "regional_quotas": [{
+                "subscription_name": "Subscription", "location": "eastus",
+                "display_name": "GPT usage", "usage_name": "OpenAI.GPT",
+                "current_value": "3", "limit": "10", "unit": "Count",
+            }],
             "apim_foundry_mappings": [
                 {"match_status": "deployment_confirmed", "deployment_id": "/ACCOUNTS/AI/DEPLOYMENTS/A"},
                 {"match_status": "resource_only", "foundry_resource_id": "/ACCOUNTS/AI",
@@ -115,3 +174,88 @@ class ReportTests(unittest.TestCase):
         unresolved = next(section for section in sections if section[0] ==
                           "Model retirement matches requiring verification")
         self.assertEqual(len(unresolved[1]), 1)
+
+    def test_customer_report_displays_new_inventory_and_groups_by_workbook_pillar(self):
+        tables = self.inventory()
+        sections = build_sections(tables)
+        by_title = {title: rows for title, rows, _, _ in sections}
+        self.assertEqual(len(PILLARS), 6)
+        self.assertTrue(all(title in SECTION_PILLARS for title, _, _, _ in sections))
+        self.assertEqual(by_title["Azure Policy assignments"][0]["effect"], "Deny")
+        self.assertEqual(by_title["Private endpoint connections"][0]["status"], "Approved")
+        self.assertEqual(by_title["Diagnostic settings coverage"][0]["enabled_logs"],
+                         "AuditEvent")
+        self.assertTrue(any(row["policy_name"] == "safe-policy"
+                            for row in by_title["Foundry RAI policy and deployment configuration"]))
+        self.assertTrue(any(row["inventory_type"] == "Product"
+                            for row in by_title["APIM APIs, products, and subscriptions"]))
+        self.assertEqual(by_title["Regional AI quota usage"][0]["unit"], "Count")
+
+        html = render_report(tables)
+        self.assertIn('id="pillar-1"', html)
+        self.assertIn('id="pillar-6"', html)
+        self.assertIn("#6 Agent Architectures", html)
+        self.assertIn("Private endpoint connections", html)
+        self.assertIn("Allowed locations", html)
+        self.assertIn("GatewayLogs", html)
+        self.assertIn("safe-policy", html)
+        self.assertIn("team-sub", html)
+
+    def test_report_marks_new_inventory_unknown_for_scans_without_added_columns(self):
+        tables = self.inventory()
+        for resource in tables["foundry_resources"]:
+            resource.pop("private_endpoint_connections", None)
+            resource.pop("rai_policies", None)
+            resource.pop("diagnostic_setting_count", None)
+            resource.pop("diagnostic_settings", None)
+        for resource in tables["apim_resources"]:
+            resource.pop("api_inventory", None)
+            resource.pop("product_inventory", None)
+            resource.pop("subscription_inventory", None)
+            resource.pop("diagnostic_setting_count", None)
+            resource.pop("diagnostic_settings", None)
+        html = render_report(tables)
+        self.assertIn("Not collected", html)
+
+    def test_report_does_not_render_partial_diagnostic_collection_as_none(self):
+        tables = self.inventory()
+        resource = tables["foundry_resources"][0]
+        resource["diagnostic_settings"] = "[]"
+        resource["diagnostic_settings_status"] = "partial"
+        rows = next(rows for title, rows, _, _ in build_sections(tables)
+                    if title == "Diagnostic settings coverage")
+        first = next(row for row in rows if row["name"] == resource["name"])
+        self.assertIn("Collection partial", first["destinations"])
+
+    def test_toc_nests_subsections_under_each_pillar_and_links_to_all_targets(self):
+        tables = self.inventory()
+        sections = build_sections(tables)
+        html = render_report(tables)
+        toc = html.split('<ul class="toc">', 1)[1].split("</nav>", 1)[0]
+        self.assertIn('<header id="top">', html)
+        self.assertIn('aria-labelledby="toc-heading"', html)
+        for pillar_index, pillar in enumerate(PILLARS, 1):
+            entry = toc.split(f'<li><a href="#pillar-{pillar_index}">', 1)[1]
+            nested = entry.split("<ul>", 1)[1].split("</ul>", 1)[0]
+            expected = [(index, title) for index, (title, _, _, _) in
+                        enumerate(sections, 1) if SECTION_PILLARS[title] == pillar]
+            self.assertEqual(nested.count("<li>"), len(expected))
+            for index, title in expected:
+                self.assertIn(f'<a href="#section-{index}">{escape(title)} ', nested)
+                self.assertIn(f'id="section-{index}"', html)
+
+    def test_back_to_top_links_at_start_and_end_of_every_section_and_subsection(self):
+        tables = self.inventory()
+        html = render_report(tables)
+        link = '<p class="back-to-top"><a href="#top">Back to top</a></p>'
+        sections = build_sections(tables)
+        self.assertEqual(html.count(link), 2 * (len(PILLARS) + len(sections)))
+        for pillar_index in range(1, len(PILLARS) + 1):
+            pillar = html.split(f'id="pillar-{pillar_index}">', 1)[1].split("</section>", 1)[0]
+            self.assertIn("</h2>" + link, pillar)
+            self.assertTrue(pillar.endswith(link))
+        for index in range(1, len(sections) + 1):
+            subsection = html.split(f'id="section-{index}">', 1)[1]
+            self.assertIn("</h3>" + link, subsection.split('<p class="note">', 1)[0])
+            ending = subsection.split(link + "</div>", 1)
+            self.assertEqual(len(ending), 2)
